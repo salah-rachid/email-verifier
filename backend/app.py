@@ -17,8 +17,6 @@ from datetime import datetime
 from datetime import timezone
 from pathlib import Path
 from typing import Any
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 
 import boto3
 import redis
@@ -57,13 +55,17 @@ EMAIL_CACHE_PREFIX = "email-cache:"
 JOB_PROGRESS_PREFIX = "job-progress:"
 JOB_CANCEL_PREFIX = "job-cancel:"
 EMAIL_REGEX = EmailValidator.SYNTAX_REGEX
-TRANSIENT_RISKY_REASONS = {
+TRANSIENT_CACHE_BYPASS_REASONS = {
+    "smtp_ok",
+    "smtp_reject",
     "smtp_timeout",
     "probe_timeout",
     "probe_unreachable",
     "probe_error",
     "domain_rate_limited",
     "daily_limit_reached",
+    "catch_all",
+    "major_provider_mx_only",
 }
 
 
@@ -74,7 +76,6 @@ class BackendServices:
     r2_client: Any
     r2_bucket: str
     validator: EmailValidator
-    probe_health_url: str
 
 
 def create_app() -> Flask:
@@ -91,8 +92,6 @@ def build_services() -> BackendServices:
     database_url = require_env("DATABASE_URL")
     redis_url = require_env("REDIS_URL")
     r2_bucket = require_env("R2_BUCKET")
-    probe_server_ip = os.getenv("PROBE_SERVER_IP", "84.8.217.135")
-    probe_server_port = int(os.getenv("PROBE_SERVER_PORT", "8080"))
 
     engine = create_engine(database_url, pool_pre_ping=True)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -112,11 +111,7 @@ def build_services() -> BackendServices:
         region_name=os.getenv("R2_REGION", "auto"),
     )
 
-    validator = EmailValidator(
-        probe_server_ip=probe_server_ip,
-        probe_server_port=probe_server_port,
-        redis_client=redis_client,
-    )
+    validator = EmailValidator(redis_client=redis_client)
 
     return BackendServices(
         session_factory=session_factory,
@@ -124,7 +119,6 @@ def build_services() -> BackendServices:
         r2_client=r2_client,
         r2_bucket=r2_bucket,
         validator=validator,
-        probe_health_url=f"http://{probe_server_ip}:{probe_server_port}/health",
     )
 
 
@@ -299,11 +293,15 @@ def register_routes(app: Flask) -> None:
             server_status["status"] = "degraded"
             server_status["r2"] = f"error: {exc}"
 
-        probe_status = fetch_probe_health(services.probe_health_url)
-        if probe_status.get("status") == "error":
-            server_status["status"] = "degraded"
-
-        return jsonify({"server": server_status, "probe_server": probe_status})
+        return jsonify(
+            {
+                "server": server_status,
+                "probe_server": {
+                    "status": "disabled",
+                    "reason": "mx_only_validation",
+                },
+            }
+        )
 
 
 def process_job(app: Flask, job_id: uuid.UUID, emails: list[str]) -> None:
@@ -823,17 +821,8 @@ def is_cancel_requested(redis_client: redis.Redis, job_id: uuid.UUID) -> bool:
     return bool(redis_client.get(cancel_key(job_id)))
 
 
-def fetch_probe_health(url: str) -> dict[str, Any]:
-    try:
-        with urllib_request.urlopen(url, timeout=5) as response:
-            payload = response.read().decode("utf-8")
-        return json.loads(payload)
-    except (urllib_error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        return {"status": "error", "reason": str(exc)}
-
-
 def should_bypass_cached_result(result: ValidationResult) -> bool:
-    return result.status == "risky" and result.reason in TRANSIENT_RISKY_REASONS
+    return result.reason in TRANSIENT_CACHE_BYPASS_REASONS
 
 
 def email_cache_key(email: str) -> str:
