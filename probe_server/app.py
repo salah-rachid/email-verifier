@@ -116,7 +116,7 @@ def probe() -> tuple[object, int] | object:
     domain = email.rsplit("@", 1)[1]
     # Major consumer providers frequently rate-limit or mask SMTP mailbox probes.
     if domain in MAJOR_PROVIDERS:
-        return jsonify({"status": "valid", "reason": "major_provider_mx_only"})
+        return jsonify({"status": "valid", "reason": "major_provider_mx_only", "code": 250})
 
     allowed, wait_seconds, rejection_reason = limiter.reserve(domain)
     if not allowed:
