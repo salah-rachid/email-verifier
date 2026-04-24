@@ -7,6 +7,11 @@ import logging
 import os
 import threading
 import uuid
+from collections import defaultdict
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
@@ -76,6 +81,7 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.config["DEFAULT_USER_ID"] = os.getenv("DEFAULT_USER_ID")
     app.config["UPLOAD_MAX_ROWS"] = int(os.getenv("UPLOAD_MAX_ROWS", "1000000"))
+    app.config["VALIDATION_WORKERS"] = max(1, int(os.getenv("VALIDATION_WORKERS", "4")))
     app.extensions["backend_services"] = build_services()
     register_routes(app)
     return app
@@ -310,52 +316,65 @@ def process_job(app: Flask, job_id: uuid.UUID, emails: list[str]) -> None:
         invalid=0,
         status="running",
     )
-    results: list[dict[str, str]] = []
+    results: list[dict[str, str] | None] = [None] * len(emails)
+    worker_count = determine_validation_worker_count(app, emails)
 
     with app.app_context():
         try:
             with services.session_factory() as session:
                 set_job_status(session, job_id, "running")
                 store_progress(services.redis_client, job_id, progress)
+                final_status = "done"
+                cancel_requested = False
+                domain_queues = build_domain_queues(emails)
+                available_domains = deque(domain_queues.keys())
+                in_flight: dict[Any, tuple[int, str]] = {}
 
-                for email in emails:
-                    if is_cancel_requested(services.redis_client, job_id):
-                        finalize_job(
-                            services=services,
-                            session=session,
-                            job_id=job_id,
-                            results=results,
-                            progress=progress,
-                            final_status="cancelled",
-                        )
-                        return
+                with ThreadPoolExecutor(
+                    max_workers=worker_count,
+                    thread_name_prefix=f"job-{job_id}",
+                ) as executor:
+                    while available_domains or in_flight:
+                        while not cancel_requested and available_domains and len(in_flight) < worker_count:
+                            domain = available_domains.popleft()
+                            index, email = domain_queues[domain].popleft()
+                            future = executor.submit(validate_email_for_job, services, email)
+                            in_flight[future] = (index, domain)
 
-                    result = load_cached_email_result(services.redis_client, email)
-                    if result is None:
-                        result = services.validator.validate_email(email)
-                        store_cached_email_result(services.redis_client, result)
-                        upsert_email_cache(session, result)
+                        if not in_flight:
+                            break
 
-                    results.append(
-                        {
-                            "email": result.email,
-                            "status": result.status,
-                            "reason": result.reason,
-                        }
-                    )
-                    update_progress_counts(progress, result.status)
-                    store_progress(services.redis_client, job_id, progress)
+                        done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            index, domain = in_flight.pop(future)
+                            result, should_persist = future.result()
 
-                    if progress["processed"] % 25 == 0 or progress["processed"] == progress["total"]:
-                        sync_job_progress(session, job_id, progress)
+                            if should_persist:
+                                store_cached_email_result(services.redis_client, result)
+                                upsert_email_cache(session, result)
+
+                            results[index] = serialize_result_row(result)
+                            update_progress_counts(progress, result.status)
+                            store_progress(services.redis_client, job_id, progress)
+
+                            if progress["processed"] % 25 == 0 or progress["processed"] == progress["total"]:
+                                sync_job_progress(session, job_id, progress)
+
+                            if not cancel_requested and domain_queues[domain]:
+                                available_domains.append(domain)
+
+                        if progress["processed"] < progress["total"] and is_cancel_requested(services.redis_client, job_id):
+                            cancel_requested = True
+                            final_status = "cancelled"
+                            available_domains.clear()
 
                 finalize_job(
                     services=services,
                     session=session,
                     job_id=job_id,
-                    results=results,
+                    results=[row for row in results if row is not None],
                     progress=progress,
-                    final_status="done",
+                    final_status=final_status,
                 )
         except Exception:  # pragma: no cover - integration path
             LOGGER.exception("Job %s failed during processing", job_id)
@@ -390,6 +409,43 @@ def finalize_job(
         r2_file_key=r2_file_key,
         finished_at=datetime.now(timezone.utc),
     )
+
+
+def determine_validation_worker_count(app: Flask, emails: list[str]) -> int:
+    configured_workers = max(1, int(app.config.get("VALIDATION_WORKERS", 4)))
+    unique_domains = len({extract_email_domain(email) for email in emails})
+    return max(1, min(configured_workers, len(emails), unique_domains or 1))
+
+
+def build_domain_queues(emails: list[str]) -> dict[str, deque[tuple[int, str]]]:
+    domain_queues: dict[str, deque[tuple[int, str]]] = defaultdict(deque)
+    for index, email in enumerate(emails):
+        domain_queues[extract_email_domain(email)].append((index, email))
+    return domain_queues
+
+
+def validate_email_for_job(
+    services: BackendServices,
+    email: str,
+) -> tuple[ValidationResult, bool]:
+    cached_result = load_cached_email_result(services.redis_client, email)
+    if cached_result is not None:
+        return cached_result, False
+
+    result = services.validator.validate_email(email)
+    return result, True
+
+
+def serialize_result_row(result: ValidationResult) -> dict[str, str]:
+    return {
+        "email": result.email,
+        "status": result.status,
+        "reason": result.reason,
+    }
+
+
+def extract_email_domain(email: str) -> str:
+    return email.rsplit("@", 1)[1].lower()
 
 
 def parse_uploaded_emails(file_bytes: bytes, extension: str, max_rows: int) -> list[str]:
