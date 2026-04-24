@@ -46,11 +46,20 @@ LOGGER = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {".csv", ".txt", ".xlsx"}
 EMAIL_RESULT_TTL_SECONDS = 60 * 60 * 24 * 30
+TRANSIENT_EMAIL_RESULT_TTL_SECONDS = 60 * 15
 PROGRESS_TTL_SECONDS = 60 * 60 * 24 * 30
 EMAIL_CACHE_PREFIX = "email-cache:"
 JOB_PROGRESS_PREFIX = "job-progress:"
 JOB_CANCEL_PREFIX = "job-cancel:"
 EMAIL_REGEX = EmailValidator.SYNTAX_REGEX
+TRANSIENT_RISKY_REASONS = {
+    "smtp_timeout",
+    "probe_timeout",
+    "probe_unreachable",
+    "probe_error",
+    "domain_rate_limited",
+    "daily_limit_reached",
+}
 
 
 @dataclass(slots=True)
@@ -655,11 +664,14 @@ def load_cached_email_result(redis_client: redis.Redis, email: str) -> Validatio
     if isinstance(raw_value, bytes):
         raw_value = raw_value.decode("utf-8")
     payload = json.loads(raw_value)
-    return ValidationResult(
+    result = ValidationResult(
         email=payload["email"],
         status=payload["status"],
         reason=payload["reason"],
     )
+    if should_bypass_cached_result(result):
+        return None
+    return result
 
 
 def store_cached_email_result(redis_client: redis.Redis, result: ValidationResult) -> None:
@@ -668,9 +680,14 @@ def store_cached_email_result(redis_client: redis.Redis, result: ValidationResul
         "status": result.status,
         "reason": result.reason,
     }
+    ttl_seconds = (
+        TRANSIENT_EMAIL_RESULT_TTL_SECONDS
+        if should_bypass_cached_result(result)
+        else EMAIL_RESULT_TTL_SECONDS
+    )
     redis_client.setex(
         email_cache_key(result.email),
-        EMAIL_RESULT_TTL_SECONDS,
+        ttl_seconds,
         json.dumps(payload),
     )
 
@@ -757,6 +774,10 @@ def fetch_probe_health(url: str) -> dict[str, Any]:
         return json.loads(payload)
     except (urllib_error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         return {"status": "error", "reason": str(exc)}
+
+
+def should_bypass_cached_result(result: ValidationResult) -> bool:
+    return result.status == "risky" and result.reason in TRANSIENT_RISKY_REASONS
 
 
 def email_cache_key(email: str) -> str:

@@ -51,7 +51,7 @@ class EmailValidator:
         probe_server_ip: str,
         redis_client: Any | None = None,
         probe_server_port: int = 8080,
-        http_timeout: float = 10.0,
+        http_timeout: float = 45.0,
         disposable_list_timeout: float = 15.0,
         dns_timeout: float = 5.0,
     ) -> None:
@@ -184,9 +184,12 @@ class EmailValidator:
             http_status = exc.code
             payload = exc.read().decode("utf-8", errors="ignore").strip()
         except (urllib_error.URLError, socket.timeout, TimeoutError):
-            return ValidationResult(email=email, status="risky", reason="smtp_timeout")
+            return ValidationResult(email=email, status="risky", reason="probe_unreachable")
 
         parsed_payload = self._parse_probe_payload(payload)
+        parsed_result = self._extract_probe_result(email=email, parsed_payload=parsed_payload)
+        if parsed_result is not None:
+            return parsed_result
 
         if self._is_catch_all(http_status=http_status, parsed_payload=parsed_payload):
             return ValidationResult(email=email, status="risky", reason="catch_all")
@@ -198,9 +201,9 @@ class EmailValidator:
         if probe_code == 550:
             return ValidationResult(email=email, status="invalid", reason="smtp_reject")
         if probe_code is None:
-            return ValidationResult(email=email, status="risky", reason="smtp_timeout")
+            return ValidationResult(email=email, status="risky", reason="probe_timeout")
 
-        return ValidationResult(email=email, status="risky", reason="smtp_timeout")
+        return ValidationResult(email=email, status="risky", reason="probe_timeout")
 
     def _build_probe_url(self, email: str) -> str:
         query = urllib_parse.urlencode({"email": email})
@@ -251,6 +254,33 @@ class EmailValidator:
             return True
 
         return False
+
+    def _extract_probe_result(
+        self,
+        email: str,
+        parsed_payload: Any,
+    ) -> ValidationResult | None:
+        if not isinstance(parsed_payload, dict):
+            return None
+
+        raw_status = str(parsed_payload.get("status") or "").strip().lower()
+        raw_reason = str(parsed_payload.get("reason") or "").strip().lower()
+
+        if raw_status in {"valid", "risky", "invalid"}:
+            return ValidationResult(
+                email=email,
+                status=raw_status,
+                reason=raw_reason or "probe_response",
+            )
+
+        if raw_status == "error":
+            return ValidationResult(
+                email=email,
+                status="risky",
+                reason=raw_reason or "probe_error",
+            )
+
+        return None
 
     def _extract_probe_code(self, http_status: int | None, parsed_payload: Any) -> int | None:
         if isinstance(parsed_payload, dict):

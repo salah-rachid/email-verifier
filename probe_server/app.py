@@ -34,6 +34,24 @@ MAX_PROBES_PER_DOMAIN_PER_HOUR = 10
 DOMAIN_PROBE_DELAY_SECONDS = 3
 DOMAIN_WINDOW_SECONDS = 60 * 60
 DNS_TIMEOUT_SECONDS = 5
+MAJOR_PROVIDERS = {
+    "gmail.com",
+    "yahoo.com",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "yahoo.fr",
+    "yahoo.co.uk",
+    "yahoo.es",
+    "yahoo.de",
+    "hotmail.fr",
+    "hotmail.co.uk",
+    "msn.com",
+    "googlemail.com",
+}
 
 
 class ProbeLimiter:
@@ -96,6 +114,10 @@ def probe() -> tuple[object, int] | object:
         return jsonify({"status": "invalid", "reason": "bad_syntax"}), 400
 
     domain = email.rsplit("@", 1)[1]
+    # Major consumer providers frequently rate-limit or mask SMTP mailbox probes.
+    if domain in MAJOR_PROVIDERS:
+        return jsonify({"status": "valid", "reason": "major_provider_mx_only"})
+
     allowed, wait_seconds, rejection_reason = limiter.reserve(domain)
     if not allowed:
         return jsonify({"status": "error", "reason": rejection_reason}), 429
